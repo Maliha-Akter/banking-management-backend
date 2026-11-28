@@ -24,30 +24,52 @@ dotenv.config();
 
 const uri = process.env.MONGODB_URI;
 const port = Number(process.env.PORT || process.env.MONGODB_PORT || 5000);
-const clientUrl = process.env.CLIENT_URL || 'http://localhost:3000';
+const defaultClientUrl = process.env.VERCEL
+  ? 'https://banking-management-ruby.vercel.app'
+  : 'http://localhost:3000';
+const rawClientUrls = (process.env.CLIENT_URL || defaultClientUrl)
+  .split(',')
+  .map((u) => u.trim().replace(/\/+$/, ''))
+  .filter(Boolean);
+const clientUrl = rawClientUrls[0] || defaultClientUrl;
 const dbName = process.env.AUTH_DB_NAME || process.env.DB_NAME || 'finova_db';
 
-if (!uri) {
-  console.error('Critical Error: MONGODB_URI environment variable is missing.');
-  process.exit(1);
+const allowedOrigins = new Set<string>([
+  ...rawClientUrls,
+  'https://banking-management-ruby.vercel.app',
+  'http://localhost:3000',
+]);
+
+function isAllowedOrigin(origin?: string): boolean {
+  if (!origin) return true;
+  const normalized = origin.trim().replace(/\/+$/, '');
+  if (allowedOrigins.has(normalized)) return true;
+  if (/^https:\/\/banking-management[a-z0-9-]*\.vercel\.app$/i.test(normalized)) {
+    return true;
+  }
+  return false;
 }
 
 const app = express();
 
+// Allow requests from our Next.js frontend with credentials (cookies & Bearer JWTs)
+const corsOptions: cors.CorsOptions = {
+  origin: (origin, callback) => {
+    callback(null, isAllowedOrigin(origin));
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Cookie', 'Idempotency-Key'],
+  exposedHeaders: ['Set-Cookie'],
+  optionsSuccessStatus: 204,
+};
+
+const corsMiddleware = cors(corsOptions);
+app.use(corsMiddleware);
+
 // Parse JSON bodies (2MB limit to support inline base64 KYC documents/photos) and HTTP cookies
 app.use(express.json({ limit: '2mb' }));
 app.use(cookieParser());
-
-// Allow requests from our Next.js frontend with credentials (cookies & Bearer JWTs)
-app.use(
-  cors({
-    origin: clientUrl,
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'Cookie', 'Idempotency-Key'],
-    exposedHeaders: ['Set-Cookie'],
-  })
-);
 
 // ============================================================================
 // 2. TYPES, INTERFACES & EXPRESS REQUEST AUGMENTATION
@@ -445,30 +467,68 @@ function buildRepaymentSchedule(
 // ============================================================================
 
 function createMongoClient(): MongoClient {
-  return new MongoClient(uri!, {
+  if (!uri) {
+    throw new Error('Critical Error: MONGODB_URI environment variable is missing.');
+  }
+  const mongoClient = new MongoClient(uri, {
     serverApi: { version: ServerApiVersion.v1, strict: true, deprecationErrors: true },
+    maxPoolSize: 10,
     serverSelectionTimeoutMS: 5000,
+    socketTimeoutMS: 45000,
   });
+
+  const resetConnection = () => {
+    dbReadyPromise = null;
+    isClientConnected = false;
+    client = undefined as unknown as MongoClient;
+  };
+  mongoClient.on('topologyClosed', resetConnection);
+  mongoClient.on('close', resetConnection);
+
+  return mongoClient;
 }
 
-let client = createMongoClient();
+let client!: MongoClient;
+let isClientConnected = false;
+let indexesInitialized = false;
+let dbReadyPromise: Promise<void> | null = null;
+
+let db: Db;
+let usersCollection: Collection<UserDocument>;
+let customerProfilesCollection: Collection<CustomerProfileDocument>;
+let accountsCollection: Collection<BankAccountDocument>;
+let accountRequestsCollection: Collection<AccountRequestDocument>;
+let transactionsCollection: Collection<TransactionDocument>;
+let requestsCollection: Collection<DepositWithdrawRequestDocument>;
+let loansCollection: Collection<LoanDocument>;
+let notificationsCollection: Collection<NotificationDocument>;
+let settingsCollection: Collection<BankSettingsDocument>;
 
 // Matches Better-Auth's `jwt()` plugin endpoint exposed by the Next.js app
 const JWKS = createRemoteJWKSet(new URL(`${clientUrl}/api/auth/jwks`));
 
 async function connectWithDnsFallback(): Promise<MongoClient> {
+  if (!client) {
+    client = createMongoClient();
+  }
+
   try {
-    await client.connect();
+    if (!isClientConnected) {
+      await client.connect();
+      isClientConnected = true;
+    }
     return client;
   } catch (error: unknown) {
+    isClientConnected = false;
     const errMessage = error instanceof Error ? error.message : '';
     const errCode = (error as { code?: string })?.code || '';
 
     // Windows/ISP DNS resolvers sometimes fail SRV lookups for mongodb+srv:// URIs
     if (
-      errMessage.includes('querySrv') ||
-      errCode === 'ESERVFAIL' ||
-      errCode === 'ECONNREFUSED'
+      !process.env.VERCEL &&
+      (errMessage.includes('querySrv') ||
+        errCode === 'ESERVFAIL' ||
+        errCode === 'ECONNREFUSED')
     ) {
       console.warn(
         'Default DNS SRV lookup failed; retrying MongoDB connection via public DNS (8.8.8.8, 1.1.1.1)...'
@@ -476,6 +536,7 @@ async function connectWithDnsFallback(): Promise<MongoClient> {
       dns.setServers(['8.8.8.8', '1.1.1.1']);
       client = createMongoClient();
       await client.connect();
+      isClientConnected = true;
       return client;
     }
 
@@ -483,173 +544,269 @@ async function connectWithDnsFallback(): Promise<MongoClient> {
   }
 }
 
-async function run() {
+async function ensureDbReady(): Promise<void> {
+  if (dbReadyPromise && isClientConnected && db) {
+    return dbReadyPromise;
+  }
+
+  dbReadyPromise = (async () => {
+    try {
+      const connectedClient = await connectWithDnsFallback();
+      const database = connectedClient.db(dbName);
+      await database.command({ ping: 1 });
+      db = database;
+
+      // Typed MongoDB Collections (shared "user" collection with Better-Auth)
+      usersCollection = db.collection('user');
+      customerProfilesCollection = db.collection('customerProfiles');
+      accountsCollection = db.collection('bankAccounts');
+      accountRequestsCollection = db.collection('accountRequests');
+      transactionsCollection = db.collection('transactions');
+      requestsCollection = db.collection('depositWithdrawRequests');
+      loansCollection = db.collection('loans');
+      notificationsCollection = db.collection('notifications');
+      settingsCollection = db.collection('bankSettings');
+
+      if (!indexesInitialized) {
+        await Promise.all([
+          customerProfilesCollection.createIndex({ userId: 1 }, { unique: true }),
+          customerProfilesCollection.createIndex({ verificationStatus: 1, updatedAt: -1 }),
+          accountsCollection.createIndex({ accountNumber: 1 }, { unique: true }),
+          accountsCollection.createIndex({ userId: 1 }),
+          accountRequestsCollection.createIndex({ userId: 1, createdAt: -1 }),
+          transactionsCollection.createIndex({ transactionId: 1 }, { unique: true }),
+          transactionsCollection.createIndex({ userId: 1, createdAt: -1 }),
+          transactionsCollection.createIndex(
+            { idempotencyKey: 1 },
+            { unique: true, partialFilterExpression: { idempotencyKey: { $type: 'string' } } }
+          ),
+          requestsCollection.createIndex(
+            { idempotencyKey: 1 },
+            { unique: true, partialFilterExpression: { idempotencyKey: { $type: 'string' } } }
+          ),
+          loansCollection.createIndex({ userId: 1, createdAt: -1 }),
+          notificationsCollection.createIndex({ userId: 1, createdAt: -1 }),
+        ]);
+
+        const existingSettings = await settingsCollection.findOne({ _id: 'global_limits' });
+        if (!existingSettings) {
+          await settingsCollection.insertOne({
+            _id: 'global_limits',
+            defaultDailyTransferLimit: 10000,
+            defaultMaxSingleTransaction: 5000,
+            defaultMinBalance: 50,
+            largeTransactionAlertThreshold: 4000,
+            transferFeePercent: 0,
+            updatedAt: new Date(),
+          });
+        }
+
+        // Migrate any legacy base64 data URIs out of Better-Auth's `user` collection
+        // into `customerProfiles` so Better-Auth session cookies & JWTs never exceed header limits.
+        const bloatedUsers = await usersCollection
+          .find({
+            $or: [
+              { image: { $regex: '^data:' } },
+              { nidDocumentUrl: { $regex: '^data:' } },
+              { supportingDocumentUrl: { $regex: '^data:' } },
+            ],
+          })
+          .toArray();
+
+        for (const u of bloatedUsers) {
+          const uid = u._id?.toString() || u.id || '';
+          if (!uid) continue;
+
+          const existingCp = await customerProfilesCollection.findOne({ userId: uid });
+          const cpUpdate: Partial<CustomerProfileDocument> = { updatedAt: new Date() };
+          const userUnset: Record<string, ''> = {};
+
+          if (u.image?.startsWith('data:')) {
+            if (!existingCp?.profilePhotoUrl) cpUpdate.profilePhotoUrl = u.image;
+            userUnset.image = '';
+          }
+          if (u.nidDocumentUrl?.startsWith('data:')) {
+            if (!existingCp?.nidDocumentUrl) cpUpdate.nidDocumentUrl = u.nidDocumentUrl;
+            userUnset.nidDocumentUrl = '';
+          }
+          if (u.supportingDocumentUrl?.startsWith('data:')) {
+            if (!existingCp?.supportingDocumentUrl) {
+              cpUpdate.supportingDocumentUrl = u.supportingDocumentUrl;
+            }
+            userUnset.supportingDocumentUrl = '';
+          }
+
+          if (Object.keys(userUnset).length > 0) {
+            await customerProfilesCollection.updateOne(
+              { userId: uid },
+              {
+                $set: cpUpdate,
+                $setOnInsert: {
+                  userId: uid,
+                  fullName: u.name || '',
+                  email: u.email || '',
+                  phone: u.phone || '',
+                  dateOfBirth: u.dateOfBirth || '',
+                  gender: u.gender || '',
+                  address: u.address || '',
+                  city: u.city || '',
+                  nationalId: u.nationalId || '',
+                  occupation: u.occupation || '',
+                  nidDocumentUrl: u.nidDocumentUrl || '',
+                  verificationStatus:
+                    u.verificationStatus || (u.kycVerified ? 'verified' : 'incomplete'),
+                  createdAt: new Date(),
+                },
+              },
+              { upsert: true }
+            );
+
+            await usersCollection.updateOne(
+              buildUserLookupFilter(uid),
+              { $unset: userUnset } as UpdateFilter<UserDocument>
+            );
+          }
+        }
+
+        indexesInitialized = true;
+      }
+    } catch (error) {
+      dbReadyPromise = null;
+      isClientConnected = false;
+      throw error;
+    }
+  })();
+
+  return dbReadyPromise;
+}
+
+async function getBankSettings(): Promise<BankSettingsDocument> {
+  const settings = await settingsCollection.findOne({ _id: 'global_limits' });
+  return (
+    settings || {
+      _id: 'global_limits',
+      defaultDailyTransferLimit: 10000,
+      defaultMaxSingleTransaction: 5000,
+      defaultMinBalance: 50,
+      largeTransactionAlertThreshold: 4000,
+      transferFeePercent: 0,
+      updatedAt: new Date(),
+    }
+  );
+}
+
+async function sendNotification(
+  userId: string,
+  title: string,
+  message: string,
+  type: NotificationDocument['type']
+) {
   try {
-    console.log('Connecting to MongoDB...');
-    await connectWithDnsFallback();
-    await client.db(dbName).command({ ping: 1 });
-    console.log(`Connected to MongoDB database: ${dbName}`);
-    const db: Db = client.db(dbName);
+    await notificationsCollection.insertOne({
+      userId,
+      title,
+      message,
+      type,
+      isRead: false,
+      createdAt: new Date(),
+    });
+  } catch (err) {
+    console.error('Notification insert failed:', err);
+  }
+}
 
-    // Typed MongoDB Collections (shared "user" collection with Better-Auth)
-    const usersCollection: Collection<UserDocument> = db.collection('user');
-    const customerProfilesCollection: Collection<CustomerProfileDocument> =
-      db.collection('customerProfiles');
-    const accountsCollection: Collection<BankAccountDocument> = db.collection('bankAccounts');
-    const accountRequestsCollection: Collection<AccountRequestDocument> =
-      db.collection('accountRequests');
-    const transactionsCollection: Collection<TransactionDocument> = db.collection('transactions');
-    const requestsCollection: Collection<DepositWithdrawRequestDocument> =
-      db.collection('depositWithdrawRequests');
-    const loansCollection: Collection<LoanDocument> = db.collection('loans');
-    const notificationsCollection: Collection<NotificationDocument> = db.collection('notifications');
-    const settingsCollection: Collection<BankSettingsDocument> = db.collection('bankSettings');
+// Ensure MongoDB connection & collections are ready for every API request (cold-start safe)
+app.use(async (req: Request, res: Response, next: NextFunction) => {
+  if (req.method === 'OPTIONS' || req.path === '/') {
+    return next();
+  }
+  try {
+    await ensureDbReady();
+    next();
+  } catch (error) {
+    console.error('Database initialization error:', error);
+    return res.status(503).json({
+      success: false,
+      message: 'Database connection unavailable. Please try again.',
+    });
+  }
+});
 
-    // Indexes for fast queries and duplicate prevention
-    await Promise.all([
-      customerProfilesCollection.createIndex({ userId: 1 }, { unique: true }),
-      customerProfilesCollection.createIndex({ verificationStatus: 1, updatedAt: -1 }),
-      accountsCollection.createIndex({ accountNumber: 1 }, { unique: true }),
-      accountsCollection.createIndex({ userId: 1 }),
-      accountRequestsCollection.createIndex({ userId: 1, createdAt: -1 }),
-      transactionsCollection.createIndex({ transactionId: 1 }, { unique: true }),
-      transactionsCollection.createIndex({ userId: 1, createdAt: -1 }),
-      transactionsCollection.createIndex(
-        { idempotencyKey: 1 },
-        { unique: true, partialFilterExpression: { idempotencyKey: { $type: 'string' } } }
-      ),
-      requestsCollection.createIndex(
-        { idempotencyKey: 1 },
-        { unique: true, partialFilterExpression: { idempotencyKey: { $type: 'string' } } }
-      ),
-      loansCollection.createIndex({ userId: 1, createdAt: -1 }),
-      notificationsCollection.createIndex({ userId: 1, createdAt: -1 }),
-    ]);
+// ------------------------------------------------------------------------
+// AUTHENTICATION & ROLE-BASED ACCESS MIDDLEWARE
+// ------------------------------------------------------------------------
 
-    // Ensure default bank-wide settings document exists
-    const existingSettings = await settingsCollection.findOne({ _id: 'global_limits' });
-    if (!existingSettings) {
-      await settingsCollection.insertOne({
-        _id: 'global_limits',
-        defaultDailyTransferLimit: 10000,
-        defaultMaxSingleTransaction: 5000,
-        defaultMinBalance: 50,
-        largeTransactionAlertThreshold: 4000,
-        transferFeePercent: 0,
-        updatedAt: new Date(),
+/**
+ * Verifies the Better-Auth JWT sent via `Authorization: Bearer <token>`
+ * (from `authClient.token()`) or cookie fallback, then loads the user's
+ * authoritative role and status from MongoDB.
+ */
+const verifyToken = async (req: Request, res: Response, next: NextFunction) => {
+  if (req.method === 'OPTIONS') return next();
+
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.startsWith('Bearer ')
+    ? authHeader.split(' ')[1]
+    : req.cookies?.['better-auth.session_token'] ||
+      req.cookies?.['__Secure-better-auth.session_token'];
+
+  if (!token) {
+    return res.status(401).json({ success: false, message: 'Unauthorized: Missing token.' });
+  }
+
+  try {
+    const { payload } = await jwtVerify(token, JWKS);
+    const userId = payload.sub;
+
+    if (!userId) {
+      return res.status(401).json({ success: false, message: 'Invalid token payload.' });
+    }
+
+    const user = await usersCollection.findOne(buildUserLookupFilter(userId));
+
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found.' });
+    }
+
+    const accountStatus: UserAccountStatus = user.status || 'active';
+    if (accountStatus === 'blocked' || accountStatus === 'deactivated') {
+      return res.status(403).json({
+        success: false,
+        message: `Account is ${accountStatus}. Please contact Finova support.`,
       });
     }
 
-    async function getBankSettings(): Promise<BankSettingsDocument> {
-      const settings = await settingsCollection.findOne({ _id: 'global_limits' });
-      return (
-        settings || {
-          _id: 'global_limits',
-          defaultDailyTransferLimit: 10000,
-          defaultMaxSingleTransaction: 5000,
-          defaultMinBalance: 50,
-          largeTransactionAlertThreshold: 4000,
-          transferFeePercent: 0,
-          updatedAt: new Date(),
-        }
-      );
-    }
-
-    async function sendNotification(
-      userId: string,
-      title: string,
-      message: string,
-      type: NotificationDocument['type']
-    ) {
-      try {
-        await notificationsCollection.insertOne({
-          userId,
-          title,
-          message,
-          type,
-          isRead: false,
-          createdAt: new Date(),
-        });
-      } catch (err) {
-        console.error('Notification insert failed:', err);
-      }
-    }
-
-    // ------------------------------------------------------------------------
-    // AUTHENTICATION & ROLE-BASED ACCESS MIDDLEWARE
-    // ------------------------------------------------------------------------
-
-    /**
-     * Verifies the Better-Auth JWT sent via `Authorization: Bearer <token>`
-     * (from `authClient.token()`) or cookie fallback, then loads the user's
-     * authoritative role and status from MongoDB.
-     */
-    const verifyToken = async (req: Request, res: Response, next: NextFunction) => {
-      if (req.method === 'OPTIONS') return next();
-
-      const authHeader = req.headers.authorization;
-      const token = authHeader?.startsWith('Bearer ')
-        ? authHeader.split(' ')[1]
-        : req.cookies?.['better-auth.session_token'] ||
-          req.cookies?.['__Secure-better-auth.session_token'];
-
-      if (!token) {
-        return res.status(401).json({ success: false, message: 'Unauthorized: Missing token.' });
-      }
-
-      try {
-        const { payload } = await jwtVerify(token, JWKS);
-        const userId = payload.sub;
-
-        if (!userId) {
-          return res.status(401).json({ success: false, message: 'Invalid token payload.' });
-        }
-
-        const user = await usersCollection.findOne(buildUserLookupFilter(userId));
-
-        if (!user) {
-          return res.status(404).json({ success: false, message: 'User not found.' });
-        }
-
-        const accountStatus: UserAccountStatus = user.status || 'active';
-        if (accountStatus === 'blocked' || accountStatus === 'deactivated') {
-          return res.status(403).json({
-            success: false,
-            message: `Account is ${accountStatus}. Please contact Finova support.`,
-          });
-        }
-
-        const canonicalUserId = user._id?.toString() || userId;
-        req.user = {
-          ...payload,
-          sub: canonicalUserId,
-          id: canonicalUserId,
-          role: normalizeRole(user.role),
-          status: accountStatus,
-        };
-
-        next();
-      } catch (error) {
-        console.error('Token verification failed:', error);
-        return res
-          .status(403)
-          .json({ success: false, message: 'Forbidden: Invalid or expired token.' });
-      }
+    const canonicalUserId = user._id?.toString() || userId;
+    req.user = {
+      ...payload,
+      sub: canonicalUserId,
+      id: canonicalUserId,
+      role: normalizeRole(user.role),
+      status: accountStatus,
     };
 
-    /** Enforces role-based authorization on the server. */
-    const requireRole = (...allowedRoles: UserRole[]) => {
-      return (req: Request, res: Response, next: NextFunction) => {
-        const role = req.user?.role;
-        if (!role || !allowedRoles.includes(role)) {
-          return res.status(403).json({
-            success: false,
-            message: `Access denied. Required role: ${allowedRoles.join(' or ')}.`,
-          });
-        }
-        next();
-      };
-    };
+    next();
+  } catch (error) {
+    console.error('Token verification failed:', error);
+    return res
+      .status(403)
+      .json({ success: false, message: 'Forbidden: Invalid or expired token.' });
+  }
+};
+
+/** Enforces role-based authorization on the server. */
+const requireRole = (...allowedRoles: UserRole[]) => {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const role = req.user?.role;
+    if (!role || !allowedRoles.includes(role)) {
+      return res.status(403).json({
+        success: false,
+        message: `Access denied. Required role: ${allowedRoles.join(' or ')}.`,
+      });
+    }
+    next();
+  };
+};
 
     // ========================================================================
     // 5. USER PROFILE, KYC VERIFICATION SUBMISSION, TRANSACTION PIN & ALERTS
@@ -754,8 +911,17 @@ async function run() {
 
         const now = new Date();
         const updateFields: Partial<UserDocument> = { updatedAt: now };
+        const unsetFields: Record<string, ''> = {};
         if (name) updateFields.name = name;
-        if (image) updateFields.image = image;
+        // Never store large base64 data URIs on Better-Auth's `user` collection;
+        // keep them in `customerProfiles` so session cookies & JWT headers stay compact.
+        if (existingUser.image?.startsWith('data:')) {
+          unsetFields.image = '';
+        }
+        if (image && !image.startsWith('data:') && image.length <= 2048) {
+          updateFields.image = image;
+          delete unsetFields.image;
+        }
         if (phone) updateFields.phone = phone;
         if (address) updateFields.address = address;
         if (city) updateFields.city = city;
@@ -764,8 +930,24 @@ async function run() {
         if (nationalId) updateFields.nationalId = nationalId;
         if (occupation) updateFields.occupation = occupation;
         if (employmentStatus) updateFields.employmentStatus = employmentStatus;
-        if (nidDocumentUrl) updateFields.nidDocumentUrl = nidDocumentUrl;
-        if (supportingDocumentUrl) updateFields.supportingDocumentUrl = supportingDocumentUrl;
+        if (existingUser.nidDocumentUrl?.startsWith('data:')) {
+          unsetFields.nidDocumentUrl = '';
+        }
+        if (nidDocumentUrl && !nidDocumentUrl.startsWith('data:') && nidDocumentUrl.length <= 2048) {
+          updateFields.nidDocumentUrl = nidDocumentUrl;
+          delete unsetFields.nidDocumentUrl;
+        }
+        if (existingUser.supportingDocumentUrl?.startsWith('data:')) {
+          unsetFields.supportingDocumentUrl = '';
+        }
+        if (
+          supportingDocumentUrl &&
+          !supportingDocumentUrl.startsWith('data:') &&
+          supportingDocumentUrl.length <= 2048
+        ) {
+          updateFields.supportingDocumentUrl = supportingDocumentUrl;
+          delete unsetFields.supportingDocumentUrl;
+        }
 
         let resolvedMonthlyIncome = existingProfile?.monthlyIncome ?? existingUser.monthlyIncome;
         if (req.body.monthlyIncome !== undefined && req.body.monthlyIncome !== '') {
@@ -853,8 +1035,13 @@ async function run() {
           ...(submitForVerification ? { submittedAt: now } : {}),
         };
 
+        const userUpdateOp: UpdateFilter<UserDocument> = {
+          $set: updateFields,
+          ...(Object.keys(unsetFields).length > 0 ? { $unset: unsetFields } : {}),
+        };
+
         await Promise.all([
-          usersCollection.updateOne(filter, { $set: updateFields }),
+          usersCollection.updateOne(filter, userUpdateOp),
           customerProfilesCollection.updateOne(
             { userId },
             {
@@ -3756,7 +3943,7 @@ async function run() {
     );
 
     // ========================================================================
-    // 13. HEALTH CHECK & SERVER START
+    // 13. HEALTH CHECK & SERVERLESS / LOCAL START
     // ========================================================================
 
     app.get('/', (_req: Request, res: Response) => {
@@ -3767,13 +3954,18 @@ async function run() {
       });
     });
 
-    app.listen(port, () => {
-      console.log(`Finova Digital Banking API running at http://localhost:${port}`);
-    });
-  } catch (error) {
-    console.error('Critical database startup error:', error);
-    process.exit(1);
-  }
-}
+    if (!process.env.VERCEL) {
+      ensureDbReady()
+        .then(() => {
+          console.log(`Connected to MongoDB database: ${dbName}`);
+          app.listen(port, () => {
+            console.log(`Finova Digital Banking API running at http://localhost:${port}`);
+          });
+        })
+        .catch((error) => {
+          console.error('Critical database startup error:', error);
+          process.exit(1);
+        });
+    }
 
-run().catch(console.dir);
+    export default app;
